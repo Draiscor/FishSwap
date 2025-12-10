@@ -15,8 +15,6 @@ if not FishSwapSavedWeapons then
 end
 
 -- === HARDCODED DATABASE ===
--- Format: [ItemID] = Bonus
--- Sources: Standard Vanilla Database + Turtle WoW Database
 local KNOWN_POLES = {
     -- Standard Vanilla Poles
     [6256] = 0, -- Fishing Pole
@@ -32,17 +30,15 @@ local KNOWN_POLES = {
 
     -- Turtle WoW Custom Poles
     [7010] = 0, -- Driftwood Fishing Pole
-    [84507] = 5 -- Barkskin Fisher (Example of another custom item)
+    [84507] = 5 -- Barkskin Fisher
 }
 
 -- Logging configuration
 local appName = "FishSwap"
-local chatFrame = DEFAULT_CHAT_FRAME -- Precache the chat frame for enhanced logging performance
-
--- PALETTE: Traffic Light
-local debugColour = "ffaaaaaa" -- Silver/Grey
-local infoColour = "ffffd100" -- Blizzard Gold
-local errorColour = "ffff0000" -- Pure Red
+local chatFrame = DEFAULT_CHAT_FRAME
+local debugColour = "ffaaaaaa"
+local infoColour = "ffffd100"
+local errorColour = "ffff0000"
 
 local PREFIX_PLAIN = appName .. ": "
 local logPrefixes = {
@@ -55,11 +51,13 @@ local function Log(level, msg)
     if level == "DEBUG" and not DEBUG_MODE then
         return
     end
-
-    -- Grab the prefix from the table, default to plain if nil
     local prefix = logPrefixes[level] or PREFIX_PLAIN
     chatFrame:AddMessage(prefix .. msg)
 end
+
+-- Hidden Tooltip for scanning
+local scanTooltip = CreateFrame("GameTooltip", "FishSwapScanner", nil, "GameTooltipTemplate")
+scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
 -- Helper: Parse Item Name from Link
 local function GetItemNameFromLink(link)
@@ -79,7 +77,7 @@ local function GetItemIDFromLink(link)
     return tonumber(id)
 end
 
--- Helper: Find item location in bags (BagID, SlotID)
+-- Helper: Find item location in bags
 local function FindItemInBags(itemName)
     if not itemName then
         return nil, nil
@@ -100,7 +98,7 @@ local function FindItemInBags(itemName)
     return nil, nil
 end
 
--- Helper: Count total free bag slots (IGNORING SPECIALTY BAGS)
+-- Helper: Count total free bag slots (IGNORING SPECIALTY BAGS via TOOLTIP SCAN)
 local function GetTotalFreeBagSlots()
     local free = 0
     for bag = 0, 4 do
@@ -108,16 +106,33 @@ local function GetTotalFreeBagSlots()
         local isGeneralBag = true
 
         -- Bag 0 is always the Backpack (General). 
-        -- For Bags 1-4, we must check if they are Quivers/Soul Bags.
-        if bag > 0 then
-            local bagID = ContainerIDToInventoryID(bag)
-            local link = GetInventoryItemLink("player", bagID)
-            if link then
-                -- GetItemInfo returns 'subType' at index 7. 
-                -- In 1.12, Quivers/Soul Bags have distinct subTypes. Standard bags are "Bag".
-                local _, _, _, _, _, _, subType = GetItemInfo(link)
-                if subType and subType ~= "Bag" then
-                    isGeneralBag = false
+        -- For Bags 1-4, we scan the tooltip for "Quiver", "Ammo", "Soul Bag", etc.
+        if bag > 0 and numSlots > 0 then
+            local invID = ContainerIDToInventoryID(bag)
+
+            scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+            scanTooltip:ClearLines()
+            local hasItem = scanTooltip:SetInventoryItem("player", invID)
+
+            if hasItem then
+                for i = 1, 4 do
+                    local left = _G["FishSwapScannerTextLeft" .. i]
+                    local right = _G["FishSwapScannerTextRight" .. i]
+                    local textL = left and left:GetText() or ""
+                    local textR = right and right:GetText() or ""
+                    local fullText = textL .. " " .. textR
+
+                    if string.find(fullText, "Quiver") or string.find(fullText, "Ammo Pouch") or
+                        string.find(fullText, "Soul Bag") or string.find(fullText, "Herb Bag") or
+                        string.find(fullText, "Enchanting Bag") or string.find(fullText, "Engineering Bag") or
+                        string.find(fullText, "Mining Sack") then
+
+                        isGeneralBag = false
+                        if DEBUG_MODE then
+                            Log("DEBUG", "Ignoring specialty bag in slot " .. bag)
+                        end
+                        break
+                    end
                 end
             end
         end
@@ -134,17 +149,12 @@ local function GetTotalFreeBagSlots()
     return free
 end
 
--- Helper: Analyze an item to see if it is a Fishing Pole
--- Returns: isPole (bool), bonus (number)
-local function AnalyzeItem(link)
+-- Helper: Analyse an item to see if it is a Fishing Pole
+local function AnalyseItem(link)
     local id = GetItemIDFromLink(link)
-
-    -- CHECK: Hardcoded Database (The Fast Track)
     if id and KNOWN_POLES[id] then
-        -- It is definitely a pole. Return the known bonus immediately.
         return true, KNOWN_POLES[id]
     end
-
     return false, 0
 end
 
@@ -154,14 +164,10 @@ local function IsFishingPoleEquipped()
     if not link then
         return false
     end
-
     local id = GetItemIDFromLink(link)
-
-    -- Check DB
     if id and KNOWN_POLES[id] then
         return true
     end
-
     return false
 end
 
@@ -213,9 +219,8 @@ local function SwapToPole()
     local hasOH = GetInventoryItemLink("player", 17)
     local freeSlots = GetTotalFreeBagSlots()
 
-    if hasMH and hasOH and freeSlots < 2 then
-        Log("ERROR",
-            "Swap aborted. You have a MH and OH equipped, but only " .. freeSlots .. " general bag slot(s) free.")
+    if hasMH and hasOH and freeSlots < 1 then
+        Log("ERROR", "Swap aborted. No general bag space detected for Off-Hand.")
         return
     end
 
@@ -235,8 +240,7 @@ local function SwapToPole()
             for slot = 1, numSlots do
                 local link = GetContainerItemLink(bag, slot)
                 if link then
-                    -- ID Check Only
-                    local isPole, bonus = AnalyzeItem(link)
+                    local isPole, bonus = AnalyseItem(link)
                     if isPole then
                         if DEBUG_MODE then
                             local name = GetItemNameFromLink(link)
@@ -258,11 +262,11 @@ local function SwapToPole()
         local poleName = GetItemNameFromLink(poleLink)
         Log("INFO", "Equipping " .. poleName .. " (Bonus: +" .. bestBonus .. ")...")
 
-        UseContainerItem(bestBag, bestSlot)
+        PickupContainerItem(bestBag, bestSlot)
+        EquipCursorItem(16)
     else
         Log("ERROR", "No Fishing Pole found in bags!")
         if not DEBUG_MODE then
-            -- Helpful tip for users who might have a custom pole not yet in the DB
             DEFAULT_CHAT_FRAME:AddMessage("If you have a custom pole, please add its Item ID to FishSwap.lua")
         end
     end
@@ -270,6 +274,7 @@ end
 
 -- Core Logic: Decision Maker
 local function ToggleFishingGear()
+    -- Safety: Clear cursor if something got stuck previously
     if CursorHasItem() then
         ClearCursor()
     end
@@ -278,30 +283,27 @@ local function ToggleFishingGear()
     local currentMHName = GetItemNameFromLink(currentMHLink)
     local savedMHName = FishSwapSavedWeapons.mh
 
-    -- DECISION 1: Are we holding the weapon we saved?
     if savedMHName and currentMHName == savedMHName then
         SwapToPole()
         return
     end
 
-    -- DECISION 2: Is the Fishing Pole equipped?
     if IsFishingPoleEquipped() then
         SwapToWeapons()
         return
     end
 
-    -- DECISION 3: Default
     SwapToPole()
 end
 
--- Helper: Reset Position Only
+-- Helper: Reset Position
 local function ResetPosition()
     FishSwap:ClearAllPoints()
     FishSwap:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
     Log("INFO", "Button position reset.")
 end
 
--- Helper: Full Reset (Right Click)
+-- Helper: Full Reset
 local function FullReset()
     ResetPosition()
     FishSwapSavedWeapons.mh = nil
@@ -323,7 +325,6 @@ tex:SetAllPoints()
 tex:SetTexture(ICON_TEXTURE)
 FishSwap.texture = tex
 
--- Drag Scripts
 FishSwap:SetScript("OnDragStart", function()
     if IsShiftKeyDown() and arg1 == "LeftButton" then
         this:StartMoving()
@@ -333,7 +334,6 @@ FishSwap:SetScript("OnDragStop", function()
     this:StopMovingOrSizing()
 end)
 
--- Click Script
 FishSwap:SetScript("OnMouseUp", function()
     if arg1 == "LeftButton" then
         ToggleFishingGear()
@@ -342,7 +342,6 @@ FishSwap:SetScript("OnMouseUp", function()
     end
 end)
 
--- Tooltip
 FishSwap:SetScript("OnEnter", function()
     GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
     GameTooltip:SetText("FishSwap")
@@ -362,7 +361,6 @@ FishSwap:SetScript("OnLeave", function()
     GameTooltip:Hide()
 end)
 
--- Slash Command Handler
 SLASH_FISHSWAP1 = "/fishswap"
 SlashCmdList["FISHSWAP"] = function(msg)
     if msg == "reset" then
