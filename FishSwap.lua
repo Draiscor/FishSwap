@@ -6,16 +6,59 @@ local BUTTON_SIZE = 32
 local ICON_TEXTURE = "Interface\\Icons\\Trade_Fishing"
 local DEBUG_MODE = false
 
--- Hidden Tooltip for scanning item stats
-local scanTooltip = CreateFrame("GameTooltip", "FishSwapScanner", nil, "GameTooltipTemplate")
-scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
-
 -- Initialize Saved Variables (Main Hand = 16, Off Hand = 17)
 if not FishSwapSavedWeapons then
     FishSwapSavedWeapons = {
         mh = nil,
         oh = nil
     }
+end
+
+-- === HARDCODED DATABASE ===
+-- Format: [ItemID] = Bonus
+-- Sources: Standard Vanilla Database + Turtle WoW Database
+local KNOWN_POLES = {
+    -- Standard Vanilla Poles
+    [6256] = 0, -- Fishing Pole
+    [6365] = 5, -- Strong Fishing Pole
+    [6366] = 15, -- Darkwood Fishing Pole
+    [6367] = 20, -- Big Iron Fishing Pole
+    [12225] = 3, -- Blump Family Fishing Pole
+    [19022] = 25, -- Nat Pagle's Extreme Angler FC-5000
+    [19970] = 35, -- Arcanite Fishing Pole
+    [4598] = 0, -- Goblin Fishing Pole
+    [3567] = 0, -- Dwarven Fishing Pole
+    [19972] = 25, -- Nat's Lucky Fishing Pole
+
+    -- Turtle WoW Custom Poles
+    [7010] = 0, -- Driftwood Fishing Pole
+    [84507] = 5 -- Barkskin Fisher (Example of another custom item)
+}
+
+-- Logging configuration
+local appName = "FishSwap"
+local chatFrame = DEFAULT_CHAT_FRAME -- Precache the chat frame for enhanced logging performance
+
+-- PALETTE: Traffic Light
+local debugColour = "ffaaaaaa" -- Silver/Grey
+local infoColour = "ffffd100" -- Blizzard Gold
+local errorColour = "ffff0000" -- Pure Red
+
+local PREFIX_PLAIN = appName .. ": "
+local logPrefixes = {
+    ["DEBUG"] = "|c" .. debugColour .. appName .. " [DEBUG]:|r ",
+    ["INFO"] = "|c" .. infoColour .. appName .. ":|r ",
+    ["ERROR"] = "|c" .. errorColour .. appName .. ":|r "
+}
+
+local function Log(level, msg)
+    if level == "DEBUG" and not DEBUG_MODE then
+        return
+    end
+
+    -- Grab the prefix from the table, default to plain if nil
+    local prefix = logPrefixes[level] or PREFIX_PLAIN
+    chatFrame:AddMessage(prefix .. msg)
 end
 
 -- Helper: Parse Item Name from Link
@@ -25,6 +68,15 @@ local function GetItemNameFromLink(link)
     end
     local name = string.gsub(link, "|c%x+|Hitem:%d+:%d+:%d+:%d+|h%[(.-)%]|h|r", "%1")
     return name
+end
+
+-- Helper: Parse Item ID from Link
+local function GetItemIDFromLink(link)
+    if not link then
+        return nil
+    end
+    local _, _, id = string.find(link, "item:(%d+)")
+    return tonumber(id)
 end
 
 -- Helper: Find item location in bags (BagID, SlotID)
@@ -48,12 +100,29 @@ local function FindItemInBags(itemName)
     return nil, nil
 end
 
--- Helper: Count total free bag slots (Vanilla 1.12 compatible)
+-- Helper: Count total free bag slots (IGNORING SPECIALTY BAGS)
 local function GetTotalFreeBagSlots()
     local free = 0
     for bag = 0, 4 do
         local numSlots = GetContainerNumSlots(bag)
-        if numSlots > 0 then
+        local isGeneralBag = true
+
+        -- Bag 0 is always the Backpack (General). 
+        -- For Bags 1-4, we must check if they are Quivers/Soul Bags.
+        if bag > 0 then
+            local bagID = ContainerIDToInventoryID(bag)
+            local link = GetInventoryItemLink("player", bagID)
+            if link then
+                -- GetItemInfo returns 'subType' at index 7. 
+                -- In 1.12, Quivers/Soul Bags have distinct subTypes. Standard bags are "Bag".
+                local _, _, _, _, _, _, subType = GetItemInfo(link)
+                if subType and subType ~= "Bag" then
+                    isGeneralBag = false
+                end
+            end
+        end
+
+        if isGeneralBag and numSlots > 0 then
             for slot = 1, numSlots do
                 local texture = GetContainerItemInfo(bag, slot)
                 if not texture then
@@ -65,194 +134,171 @@ local function GetTotalFreeBagSlots()
     return free
 end
 
--- Helper: Analyze an item to see if it is a Fishing Pole and what bonus it has
+-- Helper: Analyze an item to see if it is a Fishing Pole
 -- Returns: isPole (bool), bonus (number)
-local function AnalyzeItem(bag, slot)
-    scanTooltip:ClearLines()
-    scanTooltip:SetBagItem(bag, slot)
+local function AnalyzeItem(link)
+    local id = GetItemIDFromLink(link)
 
-    local isPole = false
-    local bonus = 0
-
-    -- Scan lines in the tooltip
-    local numLines = scanTooltip:NumLines()
-    if numLines > 10 then
-        numLines = 10
+    -- CHECK: Hardcoded Database (The Fast Track)
+    if id and KNOWN_POLES[id] then
+        -- It is definitely a pole. Return the known bonus immediately.
+        return true, KNOWN_POLES[id]
     end
 
-    for i = 1, numLines do
-        local lineObj = _G["FishSwapScannerTextLeft" .. i]
-        local lineObjRight = _G["FishSwapScannerTextRight" .. i]
-
-        if lineObj then
-            local text = lineObj:GetText()
-            local textR = lineObjRight and lineObjRight:GetText() or ""
-
-            if text then
-                -- CHECK 1: Is it a fishing pole?
-                if string.find(text, "Fishing Pole") or string.find(textR, "Fishing Pole") then
-                    isPole = true
-                end
-
-                -- CHECK 2: Does it have a bonus?
-                local _, _, foundBonus = string.find(text, "Fishing %+(%d+)")
-                if foundBonus then
-                    bonus = tonumber(foundBonus)
-                end
-            end
-        end
-    end
-
-    return isPole, bonus
+    return false, 0
 end
 
 -- Helper: Is a fishing pole equipped?
 local function IsFishingPoleEquipped()
-    scanTooltip:ClearLines()
-    scanTooltip:SetInventoryItem("player", 16)
-
-    local numLines = scanTooltip:NumLines()
-    if numLines > 10 then
-        numLines = 10
+    local link = GetInventoryItemLink("player", 16)
+    if not link then
+        return false
     end
 
-    for i = 1, numLines do
-        local lineObj = _G["FishSwapScannerTextLeft" .. i]
-        local lineObjRight = _G["FishSwapScannerTextRight" .. i]
+    local id = GetItemIDFromLink(link)
 
-        if lineObj then
-            local text = lineObj:GetText()
-            local textR = lineObjRight and lineObjRight:GetText() or ""
-
-            if text and (string.find(text, "Fishing Pole") or string.find(textR, "Fishing Pole")) then
-                return true
-            end
-        end
+    -- Check DB
+    if id and KNOWN_POLES[id] then
+        return true
     end
+
     return false
 end
 
--- Core Logic: Toggle Equipment
-local function ToggleFishingGear()
-    if IsFishingPoleEquipped() then
-        -- === MODE: SWAP BACK TO WEAPONS ===
+-- ACTION: Swap TO Weapons
+local function SwapToWeapons()
+    local mhName = FishSwapSavedWeapons.mh
+    local ohName = FishSwapSavedWeapons.oh
 
-        local mhName = FishSwapSavedWeapons.mh
-        local ohName = FishSwapSavedWeapons.oh
+    if not mhName and not ohName then
+        Log("ERROR", "No saved weapons found. Please equip your weapons manually once to initialize.")
+        return
+    end
 
-        if not mhName and not ohName then
-            DEFAULT_CHAT_FRAME:AddMessage(
-                "|cffff0000FishSwap:|r No saved weapons found. Please equip your weapons manually once to initialize.")
-            return
+    local proceedToOffHand = true
+
+    -- 1. Equip Main Hand
+    if mhName then
+        local bag, slot = FindItemInBags(mhName)
+        if bag and slot then
+            Log("INFO", "Equipping Main Hand...")
+            PickupContainerItem(bag, slot)
+            EquipCursorItem(16)
+        else
+            Log("ERROR", "Could not find Main Hand: " .. mhName)
+            proceedToOffHand = false
         end
+    end
 
-        local proceedToOffHand = true
-
-        -- 1. Equip Main Hand
-        if mhName then
-            local bag, slot = FindItemInBags(mhName)
-            if bag and slot then
-                DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00FishSwap:|r Equipping Main Hand...")
-                PickupContainerItem(bag, slot)
-                EquipCursorItem(16)
-            else
-                DEFAULT_CHAT_FRAME:AddMessage("|cffff0000Error:|r Could not find Main Hand: " .. mhName)
-                proceedToOffHand = false
+    -- 2. Equip Off Hand
+    if ohName then
+        if proceedToOffHand then
+            local bagOH, slotOH = FindItemInBags(ohName)
+            if bagOH and slotOH then
+                Log("INFO", "Equipping Off Hand...")
+                PickupContainerItem(bagOH, slotOH)
+                EquipCursorItem(17)
+            elseif ohName then
+                Log("ERROR", "Could not find Off Hand: " .. ohName)
             end
+        else
+            Log("ERROR", "Aborting Off-Hand equip because Main Hand is missing.")
         end
+    end
+end
 
-        -- 2. Equip Off Hand
-        if ohName then
-            if proceedToOffHand then
-                local bagOH, slotOH = FindItemInBags(ohName)
-                if bagOH and slotOH then
-                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00FishSwap:|r Equipping Off Hand...")
-                    PickupContainerItem(bagOH, slotOH)
-                    EquipCursorItem(17)
-                elseif ohName then
-                    DEFAULT_CHAT_FRAME:AddMessage("|cffff0000Error:|r Could not find Off Hand: " .. ohName)
-                end
-            else
-                DEFAULT_CHAT_FRAME:AddMessage(
-                    "|cffff0000FishSwap:|r Aborting Off-Hand equip because Main Hand is missing.")
-            end
-        end
+-- ACTION: Swap TO Pole
+local function SwapToPole()
+    local hasMH = GetInventoryItemLink("player", 16)
+    local hasOH = GetInventoryItemLink("player", 17)
+    local freeSlots = GetTotalFreeBagSlots()
 
-    else
-        -- === MODE: SWAP TO FISHING POLE ===
+    if hasMH and hasOH and freeSlots < 2 then
+        Log("ERROR",
+            "Swap aborted. You have a MH and OH equipped, but only " .. freeSlots .. " general bag slot(s) free.")
+        return
+    end
 
-        local hasMH = GetInventoryItemLink("player", 16)
-        local hasOH = GetInventoryItemLink("player", 17)
-        local freeSlots = GetTotalFreeBagSlots()
+    -- Save current gear
+    FishSwapSavedWeapons.mh = GetItemNameFromLink(hasMH)
+    FishSwapSavedWeapons.oh = GetItemNameFromLink(hasOH)
 
-        if hasMH and hasOH and freeSlots < 2 then
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff0000FishSwap Error:|r Swap aborted.")
-            DEFAULT_CHAT_FRAME:AddMessage("You have a MH and OH equipped, but only " .. freeSlots ..
-                                              " bag slot(s) free.")
-            return
-        end
+    -- Find the BEST Fishing Pole
+    local bestBag, bestSlot = nil, nil
+    local bestBonus = -1
 
-        -- Save current gear
-        FishSwapSavedWeapons.mh = GetItemNameFromLink(hasMH)
-        FishSwapSavedWeapons.oh = GetItemNameFromLink(hasOH)
+    Log("DEBUG", "Scanning Bags...")
 
-        -- Find the BEST Fishing Pole
-        local bestBag, bestSlot = nil, nil
-        local bestBonus = -1
-
-        if DEBUG_MODE then
-            DEFAULT_CHAT_FRAME:AddMessage("FishSwap Debug: Scanning Bags...")
-        end
-
-        for bag = 0, 4 do
-            local numSlots = GetContainerNumSlots(bag)
-            if numSlots > 0 then
-                for slot = 1, numSlots do
-                    local link = GetContainerItemLink(bag, slot)
-                    if link then
-                        -- Analyze every item using SetBagItem
-                        local isPole, bonus = AnalyzeItem(bag, slot)
-
-                        if isPole then
-                            if DEBUG_MODE then
-                                local name = GetItemNameFromLink(link)
-                                DEFAULT_CHAT_FRAME:AddMessage("Found Pole: " .. name .. " (+" .. bonus .. ")")
-                            end
-
-                            if bonus > bestBonus then
-                                bestBonus = bonus
-                                bestBag = bag
-                                bestSlot = slot
-                            end
+    for bag = 0, 4 do
+        local numSlots = GetContainerNumSlots(bag)
+        if numSlots > 0 then
+            for slot = 1, numSlots do
+                local link = GetContainerItemLink(bag, slot)
+                if link then
+                    -- ID Check Only
+                    local isPole, bonus = AnalyzeItem(link)
+                    if isPole then
+                        if DEBUG_MODE then
+                            local name = GetItemNameFromLink(link)
+                            Log("DEBUG", "Found Pole: " .. (name or "Unknown") .. " (+" .. bonus .. ")")
+                        end
+                        if bonus > bestBonus then
+                            bestBonus = bonus
+                            bestBag = bag
+                            bestSlot = slot
                         end
                     end
                 end
             end
         end
+    end
 
-        if bestBag and bestSlot then
-            local poleLink = GetContainerItemLink(bestBag, bestSlot)
-            local poleName = GetItemNameFromLink(poleLink)
-            DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00FishSwap:|r Equipping " .. poleName .. " (Bonus: +" .. bestBonus ..
-                                              ")...")
+    if bestBag and bestSlot then
+        local poleLink = GetContainerItemLink(bestBag, bestSlot)
+        local poleName = GetItemNameFromLink(poleLink)
+        Log("INFO", "Equipping " .. poleName .. " (Bonus: +" .. bestBonus .. ")...")
 
-            PickupContainerItem(bestBag, bestSlot)
-            EquipCursorItem(16)
-        else
-            DEFAULT_CHAT_FRAME:AddMessage("|cffff0000FishSwap:|r No Fishing Pole found in bags!")
-            if not DEBUG_MODE then
-                DEFAULT_CHAT_FRAME:AddMessage(
-                    "If you have a pole, edit the LUA file and set DEBUG_MODE = true to see why it's skipped.")
-            end
+        UseContainerItem(bestBag, bestSlot)
+    else
+        Log("ERROR", "No Fishing Pole found in bags!")
+        if not DEBUG_MODE then
+            -- Helpful tip for users who might have a custom pole not yet in the DB
+            DEFAULT_CHAT_FRAME:AddMessage("If you have a custom pole, please add its Item ID to FishSwap.lua")
         end
     end
+end
+
+-- Core Logic: Decision Maker
+local function ToggleFishingGear()
+    if CursorHasItem() then
+        ClearCursor()
+    end
+
+    local currentMHLink = GetInventoryItemLink("player", 16)
+    local currentMHName = GetItemNameFromLink(currentMHLink)
+    local savedMHName = FishSwapSavedWeapons.mh
+
+    -- DECISION 1: Are we holding the weapon we saved?
+    if savedMHName and currentMHName == savedMHName then
+        SwapToPole()
+        return
+    end
+
+    -- DECISION 2: Is the Fishing Pole equipped?
+    if IsFishingPoleEquipped() then
+        SwapToWeapons()
+        return
+    end
+
+    -- DECISION 3: Default
+    SwapToPole()
 end
 
 -- Helper: Reset Position Only
 local function ResetPosition()
     FishSwap:ClearAllPoints()
     FishSwap:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00FishSwap:|r Button position reset.")
+    Log("INFO", "Button position reset.")
 end
 
 -- Helper: Full Reset (Right Click)
@@ -260,7 +306,7 @@ local function FullReset()
     ResetPosition()
     FishSwapSavedWeapons.mh = nil
     FishSwapSavedWeapons.oh = nil
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00FishSwap:|r Saved weapon data cleared.")
+    Log("INFO", "Saved weapon data cleared.")
 end
 
 -- UI Construction
@@ -322,8 +368,8 @@ SlashCmdList["FISHSWAP"] = function(msg)
     if msg == "reset" then
         ResetPosition()
     else
-        DEFAULT_CHAT_FRAME:AddMessage("FishSwap: Type |cff00ffff/fishswap reset|r to reset button position.")
+        Log("INFO", "Type |cff00ffff/fishswap reset|r to reset button position.")
     end
 end
 
-DEFAULT_CHAT_FRAME:AddMessage("FishSwap Loaded. Shift+Drag to move. Type /fishswap reset to rescue button.")
+Log("INFO", "Loaded")
