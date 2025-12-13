@@ -3,7 +3,7 @@ name: Package Addon for Release
 # Trigger this action only when a new Release is created in the GitHub UI
 on:
   release:
-    types: [created]
+    types: [created, edited]
 
 jobs:
   build:
