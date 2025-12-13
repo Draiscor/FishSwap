@@ -1,0 +1,31 @@
+name: Package Addon for Release
+
+# Trigger this action only when a new Release is created in the GitHub UI
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out the code from the repo
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2: Create the folder structure and zip it
+      # We create a folder named 'FishSwap' so that when users extract it,
+      # it is already inside the correct directory for their Interface/AddOns/ folder.
+      - name: Bundle and Zip
+        run: |
+          mkdir FishSwap
+          cp FishSwap.lua FishSwap.toc README.md FishSwap/
+          zip -r FishSwap.zip FishSwap
+
+      # Step 3: Upload the zip file to the Release page automatically
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: FishSwap.zip
